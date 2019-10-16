@@ -166,9 +166,9 @@ impl InitialHandler {
             panic!("Called InitialHandler::handle_packet() after completion");
         }
 
-        if let Err(e) = _handle_packet(self, packet).await {
+        if let Err(e) = self._handle_packet(packet).await {
             // Disconnect
-            disconnect_login(self, &format!("{}", e));
+            self.disconnect_login(&format!("{}", e));
 
             if let Some(info) = &self.info {
                 info!(
@@ -189,60 +189,290 @@ impl InitialHandler {
 
         new_vec
     }
-}
 
-/// Handles a packet, returning `Err` if the player
-/// should be disconnected.
-async fn _handle_packet(ih: &mut InitialHandler, packet: Box<dyn Packet>) -> Result<(), Error> {
-    // Find packet type and forward to correct function
-    match packet.ty() {
-        PacketType::Handshake => handle_handshake(ih, cast_packet::<Handshake>(&*packet))?,
-        PacketType::Request => handle_request(ih, cast_packet::<Request>(&*packet))?,
-        PacketType::Ping => handle_ping(ih, cast_packet::<Ping>(&*packet))?,
-        PacketType::LoginStart => handle_login_start(ih, cast_packet::<LoginStart>(&*packet))?,
-        PacketType::EncryptionResponse => {
-            handle_encryption_response(ih, cast_packet::<EncryptionResponse>(&*packet)).await?
+    /// Handles a packet, returning `Err` if the player
+    /// should be disconnected.
+    async fn _handle_packet(&mut self, packet: Box<dyn Packet>) -> Result<(), Error> {
+        // Find packet type and forward to correct function
+        match packet.ty() {
+            PacketType::Handshake => self.handle_handshake(cast_packet::<Handshake>(&*packet))?,
+            PacketType::Request => self.handle_request(cast_packet::<Request>(&*packet))?,
+            PacketType::Ping => self.handle_ping(cast_packet::<Ping>(&*packet))?,
+            PacketType::LoginStart => {
+                self.handle_login_start(cast_packet::<LoginStart>(&*packet))?
+            }
+            PacketType::EncryptionResponse => {
+                self.handle_encryption_response(cast_packet::<EncryptionResponse>(&*packet))
+                    .await?
+            }
+            ty => return Err(Error::InvalidPacket(ty, self.stage)),
         }
-        ty => return Err(Error::InvalidPacket(ty, ih.stage)),
+
+        Ok(())
     }
 
-    Ok(())
-}
+    fn handle_handshake(&mut self, packet: &Handshake) -> Result<(), Error> {
+        self.check_stage(Stage::AwaitHandshake, packet.ty())?;
 
-fn handle_handshake(ih: &mut InitialHandler, packet: &Handshake) -> Result<(), Error> {
-    check_stage(ih, Stage::AwaitHandshake, packet.ty())?;
+        self.stage = match packet.next_state {
+            HandshakeState::Status => {
+                self.action_queue
+                    .push(Action::SetStage(PacketStage::Status));
+                Stage::AwaitRequest
+            }
+            HandshakeState::Login => {
+                // While status requests can use differing
+                // protocol versions, a client
+                // needs to have a matching protocol version
+                // to log in.
+                if packet.protocol_version != PROTOCOL_VERSION {
+                    return Err(Error::InvalidProtocol(packet.protocol_version));
+                }
 
-    ih.stage = match packet.next_state {
-        HandshakeState::Status => {
-            ih.action_queue.push(Action::SetStage(PacketStage::Status));
-            Stage::AwaitRequest
-        }
-        HandshakeState::Login => {
-            // While status requests can use differing
-            // protocol versions, a client
-            // needs to have a matching protocol version
-            // to log in.
-            if packet.protocol_version != PROTOCOL_VERSION {
-                return Err(Error::InvalidProtocol(packet.protocol_version));
+                // If the server has BungeeCord proxy mode enabled, extract the data that is submitted
+                // by BungeeCord if IP forwarding is enabled.
+                if self.config.proxy.proxy_mode == ProxyMode::BungeeCord {
+                    let bungeecord_data = extract_bungeecord_data(packet)?;
+                    self.info = Some(JoinResult {
+                        username: None,
+                        uuid: bungeecord_data.uuid,
+                        props: bungeecord_data.properties,
+                    });
+                }
+
+                self.action_queue.push(Action::SetStage(PacketStage::Login));
+                Stage::AwaitLoginStart
+            }
+        };
+
+        Ok(())
+    }
+
+    fn handle_request(&mut self, packet: &Request) -> Result<(), Error> {
+        self.check_stage(Stage::AwaitRequest, packet.ty())?;
+        let server_icon = (*self.server_icon).clone().unwrap_or_default();
+
+        // Send response packet
+        let json = json!({
+            "version": {
+                "name": SERVER_VERSION,
+                "protocol": PROTOCOL_VERSION,
+            },
+            "players": {
+                "max": self.config.server.max_players,
+                "online": self.player_count.0.load(Ordering::SeqCst),
+            },
+            "description": {
+                "text": self.config.server.motd,
+            },
+            "favicon": server_icon,
+        });
+
+        let response = Response::new(json.to_string());
+        self.send_packet(response);
+
+        self.stage = Stage::AwaitPing;
+
+        Ok(())
+    }
+
+    fn handle_ping(&mut self, packet: &Ping) -> Result<(), Error> {
+        self.check_stage(Stage::AwaitPing, packet.ty())?;
+
+        let pong = Pong::new(packet.payload);
+        self.send_packet(pong);
+
+        // After sending pong, we should disconnect.
+        self.action_queue.push(Action::Disconnect);
+        self.stage = Stage::Finished;
+
+        Ok(())
+    }
+
+    fn handle_login_start(&mut self, packet: &LoginStart) -> Result<(), Error> {
+        self.check_stage(Stage::AwaitLoginStart, packet.ty())?;
+
+        // If in online mode, encryption needs to be enabled,
+        // and authentication needs to be performed.
+        // If not in online mode, the login sequence is
+        // already finished, so we can call `finish` after
+        // setting the player's info.
+        if self.config.server.online_mode {
+            use num_bigint::{BigInt, Sign::Plus};
+            // Start enabling encryption
+            let der = der::public_key_to_der(
+                &BigInt::from_biguint(Plus, RSA_KEY.n().clone()).to_signed_bytes_be(),
+                &BigInt::from_biguint(Plus, RSA_KEY.e().clone()).to_signed_bytes_be(),
+            );
+
+            let encryption_request = EncryptionRequest::new(
+                "".to_string(), // Server ID - always empty
+                der,
+                self.verify_token.to_vec(),
+            );
+            self.send_packet(encryption_request);
+
+            self.info = Some(JoinResult::with_username(packet.username.clone()));
+
+            self.stage = Stage::AwaitEncryptionResponse;
+        } else {
+            let username = packet.username.clone();
+
+            // Check if there is some info about the client available. This can be the case if the
+            // handshake is made by an IP forwarding proxy.
+            if self.info.is_some() {
+                let mut info = self.info.as_mut().unwrap();
+                if info.username.is_none() {
+                    info.username = Some(username);
+                }
+            } else {
+                // Finished - set info and join
+                self.info = Some(JoinResult::with_username(username))
             }
 
-            // If the server has BungeeCord proxy mode enabled, extract the data that is submitted
-            // by BungeeCord if IP forwarding is enabled.
-            if ih.config.proxy.proxy_mode == ProxyMode::BungeeCord {
-                let bungeecord_data = extract_bungeecord_data(packet)?;
-                ih.info = Some(JoinResult {
-                    username: None,
-                    uuid: bungeecord_data.uuid,
-                    props: bungeecord_data.properties,
-                });
-            }
-
-            ih.action_queue.push(Action::SetStage(PacketStage::Login));
-            Stage::AwaitLoginStart
+            self.finish();
         }
-    };
 
-    Ok(())
+        Ok(())
+    }
+
+    async fn handle_encryption_response(
+        &mut self,
+        packet: &EncryptionResponse,
+    ) -> Result<(), Error> {
+        self.check_stage(Stage::AwaitEncryptionResponse, packet.ty())?;
+
+        // Decrypt verify token + shared secret
+        let shared_secret = decrypt_using_rsa(&packet.secret, &RSA_KEY)?;
+        if shared_secret.len() != SHARED_SECRET_LEN {
+            return Err(Error::BadSecretLength);
+        }
+
+        let verify_token = decrypt_using_rsa(&packet.verify_token, &RSA_KEY)?;
+        if verify_token.len() != self.verify_token.len() {
+            return Err(Error::VerifyTokenMismatch);
+        }
+
+        // Check that verify token matches
+        if verify_token.as_slice() != self.verify_token {
+            return Err(Error::VerifyTokenMismatch);
+        }
+
+        // Enable encryption
+        let mut key = [0u8; SHARED_SECRET_LEN];
+        for (i, x) in shared_secret[..SHARED_SECRET_LEN].iter().enumerate() {
+            key[i] = *x;
+        }
+
+        self.key = Some(key);
+        self.action_queue
+            .push(Action::EnableEncryption(self.key.unwrap()));
+
+        use num_bigint::{BigInt, Sign::Plus};
+        let der = der::public_key_to_der(
+            &BigInt::from_biguint(Plus, RSA_KEY.n().clone()).to_signed_bytes_be(),
+            &BigInt::from_biguint(Plus, RSA_KEY.e().clone()).to_signed_bytes_be(),
+        );
+
+        // This unwrapping can be shorter with the use of .flatten() which will stabilize in Rust 1.40.
+        let username = self
+            .info
+            .as_ref()
+            .map(|x| x.username.as_ref())
+            .and_then(|x| x)
+            .ok_or(Error::OptionIsNone)?;
+
+        // Perform authentication
+        let auth_result = mojang_api::server_auth(
+            &mojang_api::server_hash("", self.key.unwrap(), der.as_slice()),
+            username,
+        )
+        .await;
+
+        match auth_result {
+            Ok(auth) => {
+                let info = JoinResult {
+                    username: Some(auth.name),
+                    uuid: auth.id,
+                    props: auth.properties,
+                };
+                self.info = Some(info);
+            }
+            Err(e) => return Err(Error::AuthenticationFailed(e)),
+        }
+
+        self.finish();
+
+        Ok(())
+    }
+
+    /// Terminates the login process, sending Set Compression (if necessary)
+    /// and Login Success.
+    ///
+    /// Before calling this function, it is expected that:
+    /// * `info` is set to a valid value
+    /// * Encryption has been enabled, if necessary
+    /// * All other login processes have already run
+    fn finish(&mut self) {
+        assert!(self.info.is_some());
+        assert!(self.info.as_ref().unwrap().username.is_some());
+
+        // Enable compression if necessary
+        let compression_threshold = self.config.io.compression_threshold;
+        if compression_threshold > 0 {
+            self.enable_compression(compression_threshold);
+        }
+
+        let info = self.info.as_ref().unwrap();
+
+        // Send Login Success
+        let login_success = LoginSuccess::new(
+            info.uuid.to_hyphenated_ref().to_string(),
+            info.username.as_ref().unwrap().to_string(),
+        );
+        self.send_packet(login_success);
+        self.action_queue.push(Action::SetStage(PacketStage::Play));
+        self.action_queue
+            .push(Action::JoinGame(self.info.clone().unwrap()));
+    }
+
+    /// Enables compression, sending the Set Compression
+    /// packet.
+    fn enable_compression(&mut self, threshold: i32) {
+        self.compression_threshold = Some(threshold);
+        self.send_packet(SetCompression::new(threshold));
+        self.action_queue.push(Action::EnableCompression(threshold));
+    }
+
+    /// Checks that the initial handler stage matches
+    /// the expected stage, returning `Err` with a proper
+    /// error message if not.
+    fn check_stage(&self, expected: Stage, packet_ty: PacketType) -> Result<(), Error> {
+        if self.stage != expected {
+            Err(Error::InvalidPacket(packet_ty, self.stage))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Disconnects the initial handler, sending
+    /// a disconnect packet containing the reason.
+    fn disconnect_login(&mut self, reason: &str) {
+        let json = json!({
+        "text": reason,
+        })
+        .to_string();
+
+        let packet = DisconnectLogin::new(json);
+        self.send_packet(packet);
+
+        self.action_queue.push(Action::Disconnect);
+    }
+
+    /// Adds a packet to the internal packet queue.
+    fn send_packet<P: Packet + 'static>(&mut self, packet: P) {
+        self.action_queue.push(Action::SendPacket(Box::new(packet)));
+    }
 }
 
 /// Tries to extract the player information that is sent in the `server_address` field of a
@@ -304,238 +534,12 @@ impl BungeeCordData {
     }
 }
 
-fn handle_request(ih: &mut InitialHandler, packet: &Request) -> Result<(), Error> {
-    check_stage(ih, Stage::AwaitRequest, packet.ty())?;
-    let server_icon = (*ih.server_icon).clone().unwrap_or_default();
-
-    // Send response packet
-    let json = json!({
-        "version": {
-            "name": SERVER_VERSION,
-            "protocol": PROTOCOL_VERSION,
-        },
-        "players": {
-            "max": ih.config.server.max_players,
-            "online": ih.player_count.0.load(Ordering::SeqCst),
-        },
-        "description": {
-            "text": ih.config.server.motd,
-        },
-        "favicon": server_icon,
-    });
-
-    let response = Response::new(json.to_string());
-    send_packet(ih, response);
-
-    ih.stage = Stage::AwaitPing;
-
-    Ok(())
-}
-
-fn handle_ping(ih: &mut InitialHandler, packet: &Ping) -> Result<(), Error> {
-    check_stage(ih, Stage::AwaitPing, packet.ty())?;
-
-    let pong = Pong::new(packet.payload);
-    send_packet(ih, pong);
-
-    // After sending pong, we should disconnect.
-    ih.action_queue.push(Action::Disconnect);
-    ih.stage = Stage::Finished;
-
-    Ok(())
-}
-
-fn handle_login_start(ih: &mut InitialHandler, packet: &LoginStart) -> Result<(), Error> {
-    check_stage(ih, Stage::AwaitLoginStart, packet.ty())?;
-
-    // If in online mode, encryption needs to be enabled,
-    // and authentication needs to be performed.
-    // If not in online mode, the login sequence is
-    // already finished, so we can call `finish` after
-    // setting the player's info.
-    if ih.config.server.online_mode {
-        use num_bigint::{BigInt, Sign::Plus};
-        // Start enabling encryption
-        let der = der::public_key_to_der(
-            &BigInt::from_biguint(Plus, RSA_KEY.n().clone()).to_signed_bytes_be(),
-            &BigInt::from_biguint(Plus, RSA_KEY.e().clone()).to_signed_bytes_be(),
-        );
-
-        let encryption_request = EncryptionRequest::new(
-            "".to_string(), // Server ID - always empty
-            der,
-            ih.verify_token.to_vec(),
-        );
-        send_packet(ih, encryption_request);
-
-        ih.info = Some(JoinResult::with_username(packet.username.clone()));
-
-        ih.stage = Stage::AwaitEncryptionResponse;
-    } else {
-        let username = packet.username.clone();
-
-        // Check if there is some info about the client available. This can be the case if the
-        // handshake is made by an IP forwarding proxy.
-        if ih.info.is_some() {
-            let mut info = ih.info.as_mut().unwrap();
-            if info.username.is_none() {
-                info.username = Some(username);
-            }
-        } else {
-            // Finished - set info and join
-            ih.info = Some(JoinResult::with_username(username))
-        }
-
-        finish(ih);
-    }
-
-    Ok(())
-}
-
-async fn handle_encryption_response(
-    ih: &mut InitialHandler,
-    packet: &EncryptionResponse,
-) -> Result<(), Error> {
-    check_stage(ih, Stage::AwaitEncryptionResponse, packet.ty())?;
-
-    // Decrypt verify token + shared secret
-    let shared_secret = decrypt_using_rsa(&packet.secret, &RSA_KEY)?;
-    if shared_secret.len() != SHARED_SECRET_LEN {
-        return Err(Error::BadSecretLength);
-    }
-
-    let verify_token = decrypt_using_rsa(&packet.verify_token, &RSA_KEY)?;
-    if verify_token.len() != ih.verify_token.len() {
-        return Err(Error::VerifyTokenMismatch);
-    }
-
-    // Check that verify token matches
-    if verify_token.as_slice() != ih.verify_token {
-        return Err(Error::VerifyTokenMismatch);
-    }
-
-    // Enable encryption
-    let mut key = [0u8; SHARED_SECRET_LEN];
-    for (i, x) in shared_secret[..SHARED_SECRET_LEN].iter().enumerate() {
-        key[i] = *x;
-    }
-
-    ih.key = Some(key);
-    ih.action_queue
-        .push(Action::EnableEncryption(ih.key.unwrap()));
-
-    use num_bigint::{BigInt, Sign::Plus};
-    let der = der::public_key_to_der(
-        &BigInt::from_biguint(Plus, RSA_KEY.n().clone()).to_signed_bytes_be(),
-        &BigInt::from_biguint(Plus, RSA_KEY.e().clone()).to_signed_bytes_be(),
-    );
-
-    // This unwrapping can be shorter with the use of .flatten() which will stabilize in Rust 1.40.
-    let username = ih
-        .info
-        .as_ref()
-        .map(|x| x.username.as_ref())
-        .and_then(|x| x)
-        .ok_or(Error::OptionIsNone)?;
-
-    // Perform authentication
-    let auth_result = mojang_api::server_auth(
-        &mojang_api::server_hash("", ih.key.unwrap(), der.as_slice()),
-        username,
-    )
-    .await;
-
-    match auth_result {
-        Ok(auth) => {
-            let info = JoinResult {
-                username: Some(auth.name),
-                uuid: auth.id,
-                props: auth.properties,
-            };
-            ih.info = Some(info);
-        }
-        Err(e) => return Err(Error::AuthenticationFailed(e)),
-    }
-
-    finish(ih);
-
-    Ok(())
-}
-
 fn decrypt_using_rsa(data: &[u8], key: &RSAPrivateKey) -> Result<Vec<u8>, Error> {
     let buf = key
         .decrypt(PaddingScheme::PKCS1v15, data)
         .map_err(|_| Error::BadEncryption)?;
 
     Ok(buf)
-}
-
-/// Terminates the login process, sending Set Compression (if necessary)
-/// and Login Success.
-///
-/// Before calling this function, it is expected that:
-/// * `info` is set to a valid value
-/// * Encryption has been enabled, if necessary
-/// * All other login processes have already run
-fn finish(ih: &mut InitialHandler) {
-    assert!(ih.info.is_some());
-    assert!(ih.info.as_ref().unwrap().username.is_some());
-
-    // Enable compression if necessary
-    let compression_threshold = ih.config.io.compression_threshold;
-    if compression_threshold > 0 {
-        enable_compression(ih, compression_threshold);
-    }
-
-    let info = ih.info.as_ref().unwrap();
-
-    // Send Login Success
-    let login_success = LoginSuccess::new(
-        info.uuid.to_hyphenated_ref().to_string(),
-        info.username.as_ref().unwrap().to_string(),
-    );
-    send_packet(ih, login_success);
-    ih.action_queue.push(Action::SetStage(PacketStage::Play));
-    ih.action_queue
-        .push(Action::JoinGame(ih.info.clone().unwrap()));
-}
-
-/// Enables compression, sending the Set Compression
-/// packet.
-fn enable_compression(ih: &mut InitialHandler, threshold: i32) {
-    ih.compression_threshold = Some(threshold);
-    send_packet(ih, SetCompression::new(threshold));
-    ih.action_queue.push(Action::EnableCompression(threshold));
-}
-
-/// Checks that the initial handler stage matches
-/// the expected stage, returning `Err` with a proper
-/// error message if not.
-fn check_stage(ih: &InitialHandler, expected: Stage, packet_ty: PacketType) -> Result<(), Error> {
-    if ih.stage != expected {
-        Err(Error::InvalidPacket(packet_ty, ih.stage))
-    } else {
-        Ok(())
-    }
-}
-
-/// Disconnects the initial handler, sending
-/// a disconnect packet containing the reason.
-fn disconnect_login(ih: &mut InitialHandler, reason: &str) {
-    let json = json!({
-        "text": reason,
-    })
-    .to_string();
-
-    let packet = DisconnectLogin::new(json);
-    send_packet(ih, packet);
-
-    ih.action_queue.push(Action::Disconnect);
-}
-
-/// Adds a packet to the internal packet queue.
-fn send_packet<P: Packet + 'static>(ih: &mut InitialHandler, packet: P) {
-    ih.action_queue.push(Action::SendPacket(Box::new(packet)));
 }
 
 #[derive(Fail, Debug, PartialEq)]
