@@ -423,7 +423,12 @@ impl InitialHandler {
             self.enable_compression(compression_threshold);
         }
 
-        let info = self.info.as_ref().unwrap();
+        // Swap the JoinResult with None, to avoid cloning it in the end. Because this is the last
+        // stage, we don't need the JoinResult for anything else. The unwrap is safe, because
+        // we asserted that self.info is not None.
+        let mut info = None;
+        std::mem::swap(&mut info, &mut self.info);
+        let info = info.unwrap();
 
         // Send Login Success
         let login_success = LoginSuccess::new(
@@ -432,8 +437,9 @@ impl InitialHandler {
         );
         self.send_packet(login_success);
         self.action_queue.push(Action::SetStage(PacketStage::Play));
+
         self.action_queue
-            .push(Action::JoinGame(self.info.clone().unwrap()));
+            .push(Action::JoinGame(info));
     }
 
     /// Enables compression, sending the Set Compression
